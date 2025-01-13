@@ -12,17 +12,140 @@
 #define MSR_IA32_VMX_CR4_FIXED0 0x488
 #define MSR_IA32_VMX_CR4_FIXED1 0x489
 #define MSR_IA32_VMX_BASIC 0x480
+#define MSR_IA32_VMX_PINBASED_CTLS 0x481
+#define PIN_BASED_VM_EXEC_CONTROLS 0x4000
+#define MSR_IA32_VMX_PROCBASED_CTLS	0x482
+#define PROC_BASED_VM_EXEC_CONTROLS	0x4002
+#define EXCEPTION_BITMAP 0x4004
 
 typedef enum {
     TRAP_OKAY,
     TRAP_CPU_UNSUPPORTED,
     TRAP_VMX_UNSUPPORTED,
     TRAP_UNABLE_TO_ALLOCATE_MEM,
-    TRAP_VMXON_FAILED
+    TRAP_VMXON_FAILED,
+    TRAP_VMPTRLD_FAILED,
+    TRAP_VMCS_INITIALIZATION_FAILED
+    
 } Trap;
 
 
-Trap enable_enter_vmx_operation(void){
+int vmwrite(long unsigned int value, long unsigned int location) {
+    uint8_t ret = 0;
+    
+        asm volatile (
+            "vmwrite %[value], %[location]; setna %[ret]"
+		    : [ret]"=rm"(ret)
+		    : [value]"rm"(value), [location]"r"(location)
+		    : "cc", "memory"
+        );
+
+    return ret;
+}
+
+int init_vm_execution_control_field(void){
+    /*
+    VM execution control further divided into following fields
+        Pin-based (asynchronous) controls
+        Processor-based (synchronous) controls
+        Exception bitmap
+        I/O bitmap addresses
+        Timestamp Counter offset
+        CR0/CR4 guest/host masks
+        CR3 targets
+        MSR Bitmaps
+        Extended-Page-Table Pointer (EPTP) 
+        Virtual-Processor Identifier (VPID) 
+    */    
+
+    
+    //pin based controls 
+    //we can put IA32_VMX_PINBASED_CTLS  values to pin based controls but we need to do and operation between first 32 bits to next 32 bits to get the supported value of that bit in pin based control.
+    long unsigned int pcontrol;
+    rdmsrl(MSR_IA32_VMX_PINBASED_CTLS, pcontrol);
+    
+    unsigned int pcontrol_final = (pcontrol & (pcontrol >> 32)); 
+    int ret = vmwrite(pcontrol_final, PIN_BASED_VM_EXEC_CONTROLS);
+
+    if(ret)
+        return 1;
+
+    //proc based control 
+    //Similar to pin based control we can set proc based control using IA32_VMX_PROCBASED_CTLS.
+    rdmsrl(MSR_IA32_VMX_PROCBASED_CTLS, pcontrol);
+    
+    pcontrol_final = (pcontrol & (pcontrol >> 32)); 
+    ret = vmwrite(pcontrol_final, PROC_BASED_VM_EXEC_CONTROLS);
+
+    if(ret)
+        return 1;
+
+    //exception bitmap
+    //setting this to 0 for now to ignore vmexit for guest exception
+    ret = vmwrite(0, EXCEPTION_BITMAP);
+
+    if(ret)
+        return 1;
+
+    return 0;
+}
+
+Trap init_vmcs(void){
+    /*
+    Section 24.3 
+        
+        The VMCS data are organized into six logical groups:
+            • Guest-state area. Processor state is saved into the guest-state area on VM exits and loaded from there on
+            VM entries.
+            • Host-state area. Processor state is loaded from the host-state area on VM exits.
+            • VM-execution control fields. These fields control processor behavior in VMX non-root operation. They
+            determine in part the causes of VM exits.
+            • VM-exit control fields. These fields control VM exits.
+            • VM-entry control fields. These fields control VM entries.
+            • VM-exit information fields. These fields receive information on VM exits and describe the cause and the
+            nature of VM exits. On some processors, these fields are read-only.
+    */
+    if( init_vm_execution_control_field() )
+        return TRAP_VMCS_INITIALIZATION_FAILED;
+
+    return TRAP_OKAY;
+}
+
+Trap setup_vmcs(void) {
+    
+    //Section 24.1
+    //A logical processor uses virtual-machine control data structures (VMCSs) while it nix operation.
+    //Section 24.2
+    //A VMCS region comprises up to 4-KBytes.
+    long unsigned int temp;
+    long unsigned int* vmcs_region = kzalloc(4096, GFP_KERNEL);
+    if(vmcs_region == NULL)
+        return TRAP_UNABLE_TO_ALLOCATE_MEM;
+
+    long unsigned int physical_address = __pa(vmcs_region);
+
+    //putting VMCS revision identifier into vmcs region
+    rdmsrl(MSR_IA32_VMX_BASIC, temp);
+    *(unsigned int*)vmcs_region = (unsigned int)temp;
+
+    //You can only change VMCS Data if the VMCS is current and Active VMCS.
+    //executing VMPTRLD to make it current and active VMCS
+    uint8_t vmptrld_result = 0;
+
+    asm volatile(
+        "vmptrld %[pa]; setna %[vr]"
+        : [vr] "=rm" (vmptrld_result)
+        : [pa] "m" (physical_address)
+        : "cc", "memory"
+    );
+
+    if(vmptrld_result)
+        return  TRAP_VMPTRLD_FAILED;
+
+    return TRAP_OKAY;
+}
+
+Trap enable_enter_vmx_operation(void) {
     
     //Section 23.7
     
@@ -122,7 +245,7 @@ Trap enable_enter_vmx_operation(void){
 		: [pa]"m"(physical_address)
 		: "cc", "memory");
     
-    if(vmxon_result != 0)
+    if(vmxon_result)
         return TRAP_VMXON_FAILED;
 
 
@@ -178,11 +301,22 @@ static int __init entry(void) {
     }pr_info("ZaWarudo: CPU compatible");
     
     trap = enable_enter_vmx_operation();
-    if(trap){
+    if(trap) {
         pr_err("ZaWarudo: ERROR: enable_enter_vmx_operation(): %d\n", trap);
         return 0;
     }pr_info("ZaWarudo: vmxon successful");
 
+    trap = setup_vmcs();
+    if(trap) {
+        pr_err("ZaWarudo: ERROR: setup_vmcs(): %d\n", trap);
+        return 0;
+    }pr_info("ZaWarudo: VMCS setup successful");
+
+    trap = init_vmcs();
+        if(trap) {
+        pr_err("ZaWarudo: ERROR: init_vmcs(): %d\n", trap);
+        return 0;
+    }pr_info("ZaWarudo: initailized VMCS");
 
     return 0;
 }
