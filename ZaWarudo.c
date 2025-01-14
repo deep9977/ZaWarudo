@@ -17,6 +17,12 @@
 #define MSR_IA32_VMX_PROCBASED_CTLS	0x482
 #define PROC_BASED_VM_EXEC_CONTROLS	0x4002
 #define EXCEPTION_BITMAP 0x4004
+#define VM_EXIT_CONTROLS 0x400c
+#define MSR_IA32_VMX_EXIT_CTLS 0x483
+#define VM_EXIT_HOST_ADDR_SPACE_SIZE 0x200
+#define VM_ENTRY_CONTROLS 0x4012
+#define MSR_IA32_VMX_ENTRY_CTLS	0x484
+#define VM_ENTRY_IA32E_MODE	0x200
 
 typedef enum {
     TRAP_OKAY,
@@ -41,6 +47,29 @@ int vmwrite(long unsigned int value, long unsigned int location) {
         );
 
     return ret;
+}
+
+int init_entry_control_field(void){
+
+    //configuring the VM-entry in same way VM-exit was configured.
+    unsigned long int econtrol;
+    rdmsrl(MSR_IA32_VMX_ENTRY_CTLS, econtrol);
+
+    unsigned int econtrol_final = econtrol | VM_ENTRY_IA32E_MODE; 
+
+    return vmwrite(econtrol_final, VM_ENTRY_CONTROLS);
+}
+
+int init_exit_control_field(void){
+    
+    //The VM-exit controls constitute a 32-bit vector that governs the basic operation of VM exits.
+    //need to set bits 9-Host address space size to 1 and can put the remaining bits from MSR_IA32_VMX_EXIT_CTLS.
+    unsigned long int econtrol;
+    rdmsrl(MSR_IA32_VMX_EXIT_CTLS, econtrol);
+
+    unsigned int econtrol_final = econtrol | VM_EXIT_HOST_ADDR_SPACE_SIZE; 
+
+    return vmwrite(econtrol_final, VM_EXIT_CONTROLS);
 }
 
 int init_vm_execution_control_field(void){
@@ -106,6 +135,12 @@ Trap init_vmcs(void){
             nature of VM exits. On some processors, these fields are read-only.
     */
     if( init_vm_execution_control_field() )
+        return TRAP_VMCS_INITIALIZATION_FAILED;
+
+    if( init_exit_control_field() )
+        return TRAP_VMCS_INITIALIZATION_FAILED;
+
+    if( init_entry_control_field() )
         return TRAP_VMCS_INITIALIZATION_FAILED;
 
     return TRAP_OKAY;
